@@ -3,6 +3,8 @@ Local Desktop GUI — Engineer B module.
 Connects to the OCR Core Service (Engineer A) at POST /api/v1/scan.
 """
 
+from __future__ import annotations
+
 import os
 import threading
 import tkinter as tk
@@ -11,198 +13,430 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import requests
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-DEFAULT_SERVICE_URL = os.getenv("OCR_SERVICE_URL", "http://127.0.0.1:8000")
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.5"))
+DEFAULT_SERVICE_URL = os.getenv("OCR_SERVICE_URL", "http://127.0.0.1:8000").strip()
+DEFAULT_MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.5"))
+ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg"}
+SCAN_TIMEOUT = 120
 
 
-class OCRApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Smart Document Scanner")
-        self.geometry("1200x720")
-        self.minsize(800, 500)
-        self.configure(bg="#f5f5f5")
+def create_root() -> tk.Tk:
+    try:
+        from tkinterdnd2 import TkinterDnD
+
+        return TkinterDnD.Tk()
+    except Exception:
+        return tk.Tk()
+
+
+class OCRApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("智慧文件掃描 — 桌面客戶端")
+        self.root.geometry("1280x760")
+        self.root.minsize(900, 560)
+        self.root.configure(bg="#f0f2f5")
 
         self._image_path: Path | None = None
         self._original_image: Image.Image | None = None
-        self._photo_ref: ImageTk.PhotoImage | None = None  # must be kept alive
+        self._processed_image: Image.Image | None = None
+        self._photo_original: ImageTk.PhotoImage | None = None
+        self._photo_processed: ImageTk.PhotoImage | None = None
         self._predictions: list[dict] = []
+        self._metadata: dict = {}
+        self._drag_drop_enabled = False
 
         self._build_ui()
-        self._try_enable_drop()
+        self._enable_drag_drop()
 
-    # ------------------------------------------------------------------ UI
+    def _build_ui(self) -> None:
+        self._build_toolbar()
+        self._build_main_pane()
+        self._build_status_bar()
 
-    def _build_ui(self):
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill=tk.X)
+    def _build_toolbar(self) -> None:
+        toolbar = ttk.Frame(self.root, padding=(10, 8))
+        toolbar.pack(fill=tk.X)
 
-        ttk.Label(top, text="Service URL:").pack(side=tk.LEFT)
+        row1 = ttk.Frame(toolbar)
+        row1.pack(fill=tk.X)
+
+        ttk.Label(row1, text="服務位址").pack(side=tk.LEFT)
         self._url_var = tk.StringVar(value=DEFAULT_SERVICE_URL)
-        ttk.Entry(top, textvariable=self._url_var, width=42).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Entry(row1, textvariable=self._url_var, width=46).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Button(row1, text="測試連線", command=self._check_health).pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(top, text="Choose Image…", command=self._pick_file).pack(side=tk.LEFT, padx=2)
-        self._scan_btn = ttk.Button(top, text="Scan", command=self._start_scan, state="disabled")
-        self._scan_btn.pack(side=tk.LEFT, padx=2)
+        row2 = ttk.Frame(toolbar)
+        row2.pack(fill=tk.X, pady=(8, 0))
 
-        self._status_var = tk.StringVar(value="Drag an image onto the canvas, or click Choose Image.")
-        ttk.Label(top, textvariable=self._status_var, foreground="#555555").pack(side=tk.LEFT, padx=10)
+        ttk.Button(row2, text="選擇圖片", command=self._pick_file).pack(side=tk.LEFT, padx=(0, 4))
+        self._scan_btn = ttk.Button(row2, text="開始掃描", command=self._start_scan, state="disabled")
+        self._scan_btn.pack(side=tk.LEFT, padx=4)
 
-        pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        ttk.Label(row2, text="信心門檻").pack(side=tk.LEFT, padx=(16, 4))
+        self._confidence_var = tk.DoubleVar(value=DEFAULT_MIN_CONFIDENCE)
+        confidence_scale = ttk.Scale(
+            row2,
+            from_=0.0,
+            to=1.0,
+            variable=self._confidence_var,
+            orient=tk.HORIZONTAL,
+            length=140,
+            command=self._update_confidence_label,
+        )
+        confidence_scale.pack(side=tk.LEFT)
+        self._confidence_label = ttk.Label(row2, text=f"{DEFAULT_MIN_CONFIDENCE:.2f}")
+        self._confidence_label.pack(side=tk.LEFT, padx=(6, 16))
 
-        # Left: image canvas
-        left_frame = ttk.LabelFrame(pane, text="Image Preview")
-        pane.add(left_frame, weight=3)
+        ttk.Button(row2, text="複製文字", command=self._copy_text).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="儲存文字", command=self._save_text).pack(side=tk.LEFT, padx=2)
 
-        self._canvas = tk.Canvas(left_frame, bg="#cccccc", cursor="hand2", highlightthickness=0)
-        self._canvas.pack(fill=tk.BOTH, expand=True)
-        self._canvas.bind("<Configure>", lambda _e: self._redraw())
-        self._canvas.bind("<Button-1>", lambda _e: self._pick_file())
+    def _build_main_pane(self) -> None:
+        pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
 
-        # Right: text results
-        right_frame = ttk.LabelFrame(pane, text="Extracted Text")
-        pane.add(right_frame, weight=2)
+        left = ttk.LabelFrame(pane, text="影像預覽", padding=4)
+        pane.add(left, weight=3)
+
+        self._preview_tabs = ttk.Notebook(left)
+        self._preview_tabs.pack(fill=tk.BOTH, expand=True)
+
+        original_tab = ttk.Frame(self._preview_tabs)
+        processed_tab = ttk.Frame(self._preview_tabs)
+        self._preview_tabs.add(original_tab, text="原圖")
+        self._preview_tabs.add(processed_tab, text="校正後標框")
+
+        self._canvas_original = tk.Canvas(original_tab, bg="#d9dde3", highlightthickness=0, cursor="hand2")
+        self._canvas_original.pack(fill=tk.BOTH, expand=True)
+        self._canvas_original.bind("<Configure>", lambda _e: self._redraw_original())
+        self._canvas_original.bind("<Button-1>", lambda _e: self._pick_file())
+
+        self._canvas_processed = tk.Canvas(processed_tab, bg="#ffffff", highlightthickness=0)
+        self._canvas_processed.pack(fill=tk.BOTH, expand=True)
+        self._canvas_processed.bind("<Configure>", lambda _e: self._redraw_processed())
+
+        hint = "拖曳圖片到左側，或點擊原圖區域選擇檔案"
+        if not self._drag_drop_enabled:
+            hint = "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
+        self._canvas_original.create_text(
+            360,
+            240,
+            text=hint,
+            fill="#666666",
+            font=("Microsoft JhengHei UI", 12),
+            tags="placeholder",
+        )
+
+        right = ttk.LabelFrame(pane, text="辨識結果", padding=4)
+        pane.add(right, weight=2)
+
+        self._summary_var = tk.StringVar(value="尚未掃描")
+        ttk.Label(right, textvariable=self._summary_var, foreground="#444444").pack(anchor=tk.W, pady=(0, 6))
 
         self._text_box = scrolledtext.ScrolledText(
-            right_frame, wrap=tk.WORD, font=("Consolas", 11), state="disabled"
+            right,
+            wrap=tk.WORD,
+            font=("Microsoft JhengHei UI", 11),
+            state="disabled",
         )
         self._text_box.pack(fill=tk.BOTH, expand=True)
 
-    def _try_enable_drop(self):
+    def _build_status_bar(self) -> None:
+        bar = ttk.Frame(self.root, padding=(10, 6))
+        bar.pack(fill=tk.X)
+        self._status_var = tk.StringVar(value="就緒")
+        ttk.Label(bar, textvariable=self._status_var).pack(side=tk.LEFT)
+
+    def _enable_drag_drop(self) -> None:
         try:
-            from tkinterdnd2 import DND_FILES  # type: ignore[import]
-            self._canvas.drop_target_register(DND_FILES)
-            self._canvas.dnd_bind("<<Drop>>", self._on_drop)
+            from tkinterdnd2 import DND_FILES
+
+            self._canvas_original.drop_target_register(DND_FILES)
+            self._canvas_original.dnd_bind("<<Drop>>", self._on_drop)
+            self._drag_drop_enabled = True
         except Exception:
-            pass  # drag-and-drop is optional; file picker always works
+            self._drag_drop_enabled = False
 
-    # ------------------------------------------------------------------ file loading
+    def _update_confidence_label(self, _value: str = "") -> None:
+        self._confidence_label.configure(text=f"{self._confidence_var.get():.2f}")
 
-    def _on_drop(self, event):
-        path = event.data.strip().strip("{}")
-        self._load_image(Path(path))
+    def _parse_drop_path(self, data: str) -> Path | None:
+        raw = data.strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1]
+        path = Path(raw)
+        return path if path.exists() else None
 
-    def _pick_file(self):
+    def _on_drop(self, event) -> None:
+        path = self._parse_drop_path(event.data)
+        if path:
+            self._load_image(path)
+
+    def _pick_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select an image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")],
+            title="選擇圖片",
+            filetypes=[("圖片檔", "*.png *.jpg *.jpeg"), ("所有檔案", "*.*")],
         )
         if path:
             self._load_image(Path(path))
 
-    def _load_image(self, path: Path):
-        if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-            messagebox.showerror("Unsupported Format", "Please select a PNG or JPEG image.")
+    def _mime_for_path(self, path: Path) -> str:
+        mapping = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        }
+        return mapping.get(path.suffix.lower(), "application/octet-stream")
+
+    def _load_image(self, path: Path) -> None:
+        if path.suffix.lower() not in ALLOWED_SUFFIXES:
+            messagebox.showerror("格式錯誤", "請選擇 PNG 或 JPEG 圖片。")
             return
+
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as exc:
+            messagebox.showerror("讀取失敗", f"無法開啟圖片：{exc}")
+            return
+
         self._image_path = path
-        self._original_image = Image.open(path)
+        self._original_image = image
+        self._processed_image = None
         self._predictions = []
-        self._redraw()
+        self._metadata = {}
         self._scan_btn.configure(state="normal")
-        self._status_var.set(f"Loaded: {path.name}")
+        self._status_var.set(f"已載入：{path.name}")
+        self._summary_var.set(f"原圖尺寸：{image.width} x {image.height}")
         self._set_text_content("")
+        self._preview_tabs.select(0)
+        self._redraw_original()
+        self._redraw_processed()
 
-    # ------------------------------------------------------------------ rendering
+    def _fit_image_to_canvas(self, image: Image.Image, canvas: tk.Canvas) -> ImageTk.PhotoImage:
+        cw = max(canvas.winfo_width(), 1)
+        ch = max(canvas.winfo_height(), 1)
+        display = image.copy()
+        display.thumbnail((cw, ch), Image.LANCZOS)
+        return ImageTk.PhotoImage(display)
 
-    def _redraw(self):
+    def _redraw_original(self) -> None:
         if self._original_image is None:
             return
-        cw = self._canvas.winfo_width() or 700
-        ch = self._canvas.winfo_height() or 500
 
-        display = self._original_image.copy()
-        if self._predictions:
-            display = self._draw_bounding_boxes(display)
+        self._photo_original = self._fit_image_to_canvas(self._original_image, self._canvas_original)
+        cw = self._canvas_original.winfo_width() or 700
+        ch = self._canvas_original.winfo_height() or 500
+        self._canvas_original.delete("all")
+        self._canvas_original.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self._photo_original)
 
-        display.thumbnail((cw, ch), Image.LANCZOS)
-        self._photo_ref = ImageTk.PhotoImage(display)
-        self._canvas.delete("all")
-        self._canvas.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self._photo_ref)
+    def _build_processed_image(self) -> Image.Image | None:
+        if not self._metadata or not self._predictions:
+            return None
 
-    def _draw_bounding_boxes(self, img: Image.Image) -> Image.Image:
-        draw = ImageDraw.Draw(img)
-        iw, ih = img.size
-        for pred in self._predictions:
+        dims = self._metadata.get("processed_dimensions", "")
+        try:
+            pw, ph = map(int, dims.lower().split("x"))
+        except ValueError:
+            return None
+
+        canvas = Image.new("RGB", (pw, ph), "white")
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.load_default()
+
+        for index, pred in enumerate(self._predictions, start=1):
             pts = [tuple(p) for p in pred["bounding_box"]]
-            # Scale bounding box from original image space (already correct here)
-            draw.polygon(pts, outline="#00cc44", width=2)
+            draw.polygon(pts, outline="#1f8f4e", width=2)
             x0 = min(p[0] for p in pts)
             y0 = min(p[1] for p in pts)
-            label = f'{pred["text"]} ({pred["confidence"]:.2f})'
-            draw.rectangle([x0, max(y0 - 16, 0), x0 + len(label) * 7, max(y0, 16)], fill="#00cc44")
-            draw.text((x0 + 1, max(y0 - 15, 1)), label, fill="#ffffff")
-        return img
+            label = f'{index}. {pred["text"]} ({pred["confidence"]:.2f})'
+            label_y = max(y0 - 14, 0)
+            draw.rectangle([x0, label_y, x0 + min(len(label) * 7, pw - x0), label_y + 14], fill="#1f8f4e")
+            draw.text((x0 + 2, label_y + 1), label, fill="#ffffff", font=font)
 
-    # ------------------------------------------------------------------ scanning
+        return canvas
 
-    def _start_scan(self):
+    def _redraw_processed(self) -> None:
+        self._canvas_processed.delete("all")
+        if self._processed_image is None:
+            cw = self._canvas_processed.winfo_width() or 700
+            ch = self._canvas_processed.winfo_height() or 500
+            self._canvas_processed.create_text(
+                cw // 2,
+                ch // 2,
+                text="掃描完成後，這裡會顯示校正後的標框預覽",
+                fill="#888888",
+                font=("Microsoft JhengHei UI", 12),
+            )
+            return
+
+        self._photo_processed = self._fit_image_to_canvas(self._processed_image, self._canvas_processed)
+        cw = self._canvas_processed.winfo_width() or 700
+        ch = self._canvas_processed.winfo_height() or 500
+        self._canvas_processed.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self._photo_processed)
+
+    def _service_base_url(self) -> str:
+        return self._url_var.get().strip().rstrip("/")
+
+    def _check_health(self) -> None:
+        url = f"{self._service_base_url()}/health"
+        self._status_var.set("正在測試連線…")
+        threading.Thread(target=self._do_health_check, args=(url,), daemon=True).start()
+
+    def _do_health_check(self, url: str) -> None:
+        try:
+            resp = requests.get(url, timeout=5)
+            resp.raise_for_status()
+            payload = resp.json()
+            status = payload.get("status", "unknown")
+            self.root.after(0, self._on_health_ok, f"連線成功：{status}")
+        except requests.exceptions.ConnectionError:
+            self.root.after(0, self._on_health_fail, f"無法連線到\n{url}\n\n請確認 Engineer A 的服務是否已啟動。")
+        except Exception as exc:
+            self.root.after(0, self._on_health_fail, str(exc))
+
+    def _on_health_ok(self, message: str) -> None:
+        self._status_var.set(message)
+        messagebox.showinfo("連線測試", message)
+
+    def _on_health_fail(self, message: str) -> None:
+        self._status_var.set("連線失敗")
+        messagebox.showerror("連線測試", message)
+
+    def _start_scan(self) -> None:
         if not self._image_path:
             return
+
         self._scan_btn.configure(state="disabled")
-        self._status_var.set("Scanning…")
+        self._status_var.set("掃描中，首次執行可能較久，請稍候…")
         threading.Thread(target=self._do_scan, daemon=True).start()
 
-    def _do_scan(self):
-        url = f"{self._url_var.get().rstrip('/')}/api/v1/scan"
+    def _do_scan(self) -> None:
+        url = f"{self._service_base_url()}/api/v1/scan"
+        confidence = round(self._confidence_var.get(), 2)
+
         try:
-            with open(self._image_path, "rb") as fh:
+            with open(self._image_path, "rb") as file_handle:
                 resp = requests.post(
                     url,
-                    files={"file": (self._image_path.name, fh, "image/jpeg")},
-                    data={"min_confidence": MIN_CONFIDENCE},
-                    timeout=60,
+                    files={
+                        "file": (
+                            self._image_path.name,
+                            file_handle,
+                            self._mime_for_path(self._image_path),
+                        )
+                    },
+                    data={"min_confidence": confidence},
+                    timeout=SCAN_TIMEOUT,
                 )
             resp.raise_for_status()
             result = resp.json()
         except requests.exceptions.ConnectionError:
-            self.after(0, self._on_scan_error, f"Cannot connect to:\n{url}\n\nIs the OCR service running?")
+            self.root.after(
+                0,
+                self._on_scan_error,
+                f"無法連線到：\n{url}\n\n請先啟動 OCR 服務（uvicorn main:app --port 8000）",
+            )
             return
         except requests.exceptions.HTTPError as exc:
-            try:
-                detail = exc.response.json().get("detail", {})
-                tag = detail.get("error", "HTTP_ERROR")
-                msg = detail.get("message", str(exc))
-            except Exception:
-                tag, msg = "HTTP_ERROR", str(exc)
-            self.after(0, self._on_scan_error, f"{tag}\n\n{msg}")
+            self.root.after(0, self._on_scan_error, self._format_http_error(exc))
             return
         except Exception as exc:
-            self.after(0, self._on_scan_error, str(exc))
+            self.root.after(0, self._on_scan_error, str(exc))
             return
 
-        self.after(0, self._on_scan_done, result)
+        self.root.after(0, self._on_scan_done, result)
 
-    def _on_scan_done(self, result: dict):
+    def _format_http_error(self, exc: requests.exceptions.HTTPError) -> str:
+        response = exc.response
+        if response is None:
+            return str(exc)
+
+        try:
+            detail = response.json().get("detail", {})
+            if isinstance(detail, dict):
+                tag = detail.get("error", "HTTP_ERROR")
+                msg = detail.get("message", response.text)
+                return f"錯誤代碼：{tag}\n\n{msg}"
+        except Exception:
+            pass
+
+        return f"HTTP {response.status_code}\n\n{response.text}"
+
+    def _on_scan_done(self, result: dict) -> None:
         self._predictions = result.get("predictions", [])
-        meta = result.get("metadata", {})
+        self._metadata = result.get("metadata", {})
+        self._processed_image = self._build_processed_image()
 
-        lines = [f'[{p["confidence"]:.4f}]  {p["text"]}' for p in self._predictions]
-        self._set_text_content("\n".join(lines) if lines else "(no text recognized)")
+        plain_lines = [pred["text"] for pred in self._predictions]
+        detail_lines = [f'[{pred["confidence"]:.4f}] {pred["text"]}' for pred in self._predictions]
+        plain_text = "\n".join(plain_lines)
+        detail_text = "\n".join(detail_lines)
 
-        self._redraw()
+        self._set_text_content(plain_text if plain_text else "（未辨識到文字，可試著調低信心門檻或換張更清晰的圖片）")
+        self._text_box.configure(state="normal")
+        if detail_lines:
+            self._text_box.insert(tk.END, "\n\n---\n詳細結果\n---\n")
+            self._text_box.insert(tk.END, detail_text)
+        self._text_box.configure(state="disabled")
+
+        self._redraw_processed()
+        self._preview_tabs.select(1)
         self._scan_btn.configure(state="normal")
-        self._status_var.set(
-            f"Done — {len(self._predictions)} result(s)  |  "
-            f'{meta.get("width")}×{meta.get("height")} → {meta.get("processed_dimensions")}'
+
+        original_size = f'{self._metadata.get("width")} x {self._metadata.get("height")}'
+        processed_size = self._metadata.get("processed_dimensions", "-")
+        self._summary_var.set(
+            f"共 {len(self._predictions)} 筆結果 | 原圖 {original_size} | 校正後 {processed_size}"
         )
+        self._status_var.set("掃描完成")
 
-    def _on_scan_error(self, message: str):
+    def _on_scan_error(self, message: str) -> None:
         self._scan_btn.configure(state="normal")
-        self._status_var.set("Scan failed — see error dialog.")
-        messagebox.showerror("Scan Error", message)
+        self._status_var.set("掃描失敗")
+        messagebox.showerror("掃描失敗", message)
 
-    def _set_text_content(self, content: str):
+    def _set_text_content(self, content: str) -> None:
         self._text_box.configure(state="normal")
         self._text_box.delete("1.0", tk.END)
         self._text_box.insert("1.0", content)
         self._text_box.configure(state="disabled")
 
+    def _copy_text(self) -> None:
+        content = self._text_box.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showinfo("複製文字", "目前沒有可複製的內容。")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content.split("\n\n---\n")[0].strip())
+        self._status_var.set("已複製辨識文字")
+
+    def _save_text(self) -> None:
+        content = self._text_box.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showinfo("儲存文字", "目前沒有可儲存的內容。")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="儲存辨識結果",
+            defaultextension=".txt",
+            filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")],
+        )
+        if not path:
+            return
+
+        Path(path).write_text(content, encoding="utf-8")
+        self._status_var.set(f"已儲存：{Path(path).name}")
+
+
+def main() -> None:
+    root = create_root()
+    OCRApp(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
-    app = OCRApp()
-    app.mainloop()
+    main()
