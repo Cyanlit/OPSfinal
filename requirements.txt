@@ -1,0 +1,15 @@
+# ── OCR Core Service (Engineer A) ──────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+easyocr>=1.7.1
+opencv-python-headless>=4.9.0.80
+numpy>=1.26.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# ── Desktop GUI Client (Engineer B) ────────────────────────────────────────
+Pillow>=10.3.0
+requests>=2.31.0
+tkinterdnd2>=0.3.0   # optional — enables drag-and-drop; GUI still works without it
