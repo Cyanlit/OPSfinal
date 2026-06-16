@@ -75,18 +75,35 @@ def _four_point_transform(
 
 # Denoising strength per level: (h, hColor)
 _DENOISE_PARAMS: dict[int, tuple[int, int]] = {
-    1: (3, 3),   # light  — mild ISO grain
-    2: (7, 7),   # medium — indoor / dim lighting
-    3: (12, 12), # heavy  — very noisy or low-resolution
+    1: (3, 3),   # minimal    — barely perceptible grain
+    2: (5, 5),   # very-light — slight sensor noise
+    3: (7, 7),   # light      — mild ISO grain
+    4: (9, 9),   # light-med  — indoor / dim lighting
+    5: (11, 11), # medium     — typical phone-camera noise
+    6: (13, 13), # med-heavy  — poor lighting or high ISO
+    7: (15, 15), # heavy      — very noisy / high-ISO
+    8: (18, 18), # very-heavy — low-res or compressed source
+    9: (21, 21), # extreme    — severely degraded image
 }
 
-_NOISE_LEVEL_LABELS = {0: "none", 1: "light", 2: "medium", 3: "heavy"}
+_NOISE_LEVEL_LABELS = {
+    0: "none",
+    1: "minimal",
+    2: "very-light",
+    3: "light",
+    4: "light-medium",
+    5: "medium",
+    6: "medium-heavy",
+    7: "heavy",
+    8: "very-heavy",
+    9: "extreme",
+}
 
 
 def _estimate_noise_level(img: np.ndarray) -> tuple[int, float]:
     """
     Returns (level, noise_score):
-      level 0–3 based on two independent signals:
+      level 0–9 based on two independent signals:
       - noise_score: std of residual after subtracting a Gaussian-blurred copy,
                      normalized by mean brightness (scale-independent).
       - resolution:  penalises images with fewer pixels, which need more aggressive
@@ -104,7 +121,7 @@ def _estimate_noise_level(img: np.ndarray) -> tuple[int, float]:
     # Low-res images need a heavier hand regardless of measured noise;
     # very high-res images (>6 MP) have fine strokes that denoising can blur, so pull back one level.
     if total_pixels < 500_000:        # < 0.5 MP
-        res_bump = 2
+        res_bump = 3
     elif total_pixels < 2_000_000:    # 0.5–2 MP
         res_bump = 1
     elif total_pixels > 6_000_000:    # > 6 MP (high-end phone / DSLR)
@@ -112,20 +129,38 @@ def _estimate_noise_level(img: np.ndarray) -> tuple[int, float]:
     else:
         res_bump = 0
 
+    # Benchmark on IMG_20260616_085152.jpg (12.6 MP, noise_score=3.03):
+    # level-0 (no denoising) produced the cleanest OCR — all tested levels 1-9
+    # introduced fragmentation or hallucination.  Root cause: the original 4-level
+    # code used noise_score < 5 as the "no denoising" boundary; expanding to 10
+    # levels had compressed that boundary to < 3, incorrectly triggering light
+    # denoising on clean high-res images.  Restored to < 5.
     if noise_score < 5:
-        base = 0
+        base = 0          # clean — skip denoising entirely
+    elif noise_score < 7:
+        base = 1          # minimal grain
     elif noise_score < 9:
-        base = 1
-    elif noise_score < 14:
-        base = 2
+        base = 2          # very-light
+    elif noise_score < 11:
+        base = 3          # light
+    elif noise_score < 13:
+        base = 4          # light-medium
+    elif noise_score < 16:
+        base = 5          # medium
+    elif noise_score < 20:
+        base = 6          # medium-heavy
+    elif noise_score < 25:
+        base = 7          # heavy
+    elif noise_score < 31:
+        base = 8          # very-heavy
     else:
-        base = 3
+        base = 9          # extreme
 
-    level = max(0, min(base + res_bump, 3))
+    level = max(0, min(base + res_bump, 9))
 
-    # Hard cap: >6 MP images must not exceed level 2 — h=12 blurs fine strokes
+    # Hard cap: >6 MP images must not exceed level 5 — h > 11 blurs fine strokes
     if total_pixels > 6_000_000:
-        level = min(level, 2)
+        level = min(level, 5)
 
     return level, round(noise_score, 2)
 
@@ -177,6 +212,153 @@ def _enhance_image(img: np.ndarray) -> tuple[np.ndarray, int, float]:
     img = cv2.addWeighted(img, 1.5, blurred, -0.5, 0)
 
     return img, noise_level, noise_score
+
+
+def _bbox_metrics(pred: dict) -> dict:
+    pts = pred["bounding_box"]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return {
+        **pred,
+        "_x_min": min(xs),
+        "_x_max": max(xs),
+        "_x_mid": sum(xs) / len(xs),
+        "_y_min": min(ys),
+        "_y_max": max(ys),
+        "_y_mid": sum(ys) / len(ys),
+        "_width": max(xs) - min(xs),
+        "_height": max(ys) - min(ys),
+    }
+
+
+def _detect_orientation(items: list[dict]) -> str:
+    """
+    Classifies layout as 'row', 'column', or 'mixed' using two signals:
+
+    1. Bounding-box aspect ratio — horizontal text (行) produces wide boxes
+       (width > height); vertical text (列) produces tall boxes (height > width).
+    2. Layout spread ratio — compare the normalised Y-spread of same-X-cluster
+       against the normalised X-spread of same-Y-cluster.  The axis that produces
+       more cohesive clusters dominates the layout.
+
+    'row'    → ≥ 70 % of boxes are wide, or Y-clusters are tighter
+    'column' → ≥ 70 % of boxes are tall, or X-clusters are tighter
+    'mixed'  → neither signal is conclusive
+    """
+    if not items:
+        return "row"
+
+    # Signal 1: per-box aspect ratio vote
+    h_votes = sum(1 for it in items if it["_width"] > it["_height"])
+    v_votes = len(items) - h_votes
+    h_ratio = h_votes / len(items)
+
+    if h_ratio >= 0.7:
+        return "row"
+    if h_ratio <= 0.3:
+        return "column"
+
+    # Signal 2: cluster-spread comparison
+    # Group by Y (rows) and measure X variance; group by X (cols) and measure Y variance.
+    # Tighter secondary-axis variance means that axis is more structured.
+    def _spread(groups: list[list[dict]], secondary_key: str) -> float:
+        variances = []
+        for g in groups:
+            vals = [it[secondary_key] for it in g]
+            mean = sum(vals) / len(vals)
+            variances.append(sum((v - mean) ** 2 for v in vals) / len(vals))
+        return sum(variances) / len(variances) if variances else float("inf")
+
+    y_mids = sorted(it["_y_mid"] for it in items)
+    med_h = sorted(it["_height"] for it in items)[len(items) // 2]
+    row_groups: list[list[dict]] = []
+    for it in sorted(items, key=lambda x: x["_y_mid"]):
+        if not row_groups or it["_y_mid"] - row_groups[-1][0]["_y_mid"] > med_h * 0.6:
+            row_groups.append([it])
+        else:
+            row_groups[-1].append(it)
+
+    med_w = sorted(it["_width"] for it in items)[len(items) // 2]
+    col_groups: list[list[dict]] = []
+    for it in sorted(items, key=lambda x: x["_x_mid"]):
+        if not col_groups or it["_x_mid"] - col_groups[-1][0]["_x_mid"] > med_w * 0.6:
+            col_groups.append([it])
+        else:
+            col_groups[-1].append(it)
+
+    row_x_spread = _spread(row_groups, "_x_mid")
+    col_y_spread = _spread(col_groups, "_y_mid")
+
+    # Rows are tighter in Y, cols are tighter in X — compare the opposite-axis spread
+    if row_x_spread < col_y_spread:
+        return "row"
+    if col_y_spread < row_x_spread:
+        return "column"
+    return "mixed"
+
+
+def _cluster_axis(
+    items: list[dict],
+    mid_key: str,
+    min_key: str,
+    max_key: str,
+    size_key: str,
+    inner_sort_key: str,
+) -> list[dict]:
+    """
+    Generic 1-D clustering.  Groups items whose `mid_key` values are close,
+    then sorts each group by `inner_sort_key`, then groups clusters into blocks
+    separated by large gaps along the same axis.
+
+    Returns a flat list of {"block", "text", "confidence"} dicts.
+    """
+    sizes = sorted(it[size_key] for it in items)
+    median_size = sizes[len(sizes) // 2]
+    group_threshold = max(median_size * 0.6, 10)
+    block_gap = max(median_size * 2.0, 20)
+
+    sorted_items = sorted(items, key=lambda it: it[mid_key])
+    groups: list[list[dict]] = []
+    for item in sorted_items:
+        if not groups or item[mid_key] - groups[-1][0][mid_key] > group_threshold:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+
+    for g in groups:
+        g.sort(key=lambda it: it[inner_sort_key])
+
+    blocks: list[list[list[dict]]] = [[groups[0]]]
+    for i in range(1, len(groups)):
+        prev_max = max(it[max_key] for it in groups[i - 1])
+        curr_min = min(it[min_key] for it in groups[i])
+        if curr_min - prev_max > block_gap:
+            blocks.append([groups[i]])
+        else:
+            blocks[-1].append(groups[i])
+
+    result = []
+    for b_idx, block in enumerate(blocks):
+        for group in block:
+            result.append({
+                "block": b_idx,
+                "text": " ".join(it["text"] for it in group),
+                "confidence": round(sum(it["confidence"] for it in group) / len(group), 4),
+            })
+    return result
+
+
+def _group_predictions(predictions: list[dict]) -> dict:
+    if not predictions:
+        return {"orientation": "row", "rows": [], "columns": []}
+
+    items = [_bbox_metrics(p) for p in predictions]
+    orientation = _detect_orientation(items)
+
+    rows = _cluster_axis(items, "_y_mid", "_y_min", "_y_max", "_height", "_x_min")
+    columns = _cluster_axis(items, "_x_mid", "_x_min", "_x_max", "_width", "_y_min")
+
+    return {"orientation": orientation, "rows": rows, "columns": columns}
 
 
 def preprocess_image(image_bytes: bytes) -> tuple[np.ndarray, dict]:
@@ -297,4 +479,9 @@ async def scan_document(
         if conf >= min_confidence
     ]
 
-    return {"success": True, "metadata": metadata, "predictions": predictions}
+    return {
+        "success": True,
+        "metadata": metadata,
+        "predictions": predictions,
+        "grouped": _group_predictions(predictions),
+    }
