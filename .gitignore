@@ -1,7 +1,36 @@
+# Environment
 .env
+
+# Virtual environment
 .venv/
-__pycache__/
-*.pyc
+
+# EasyOCR / PyTorch model weights
 models/
-outputs/
+
+# Upload / output directories
 uploads/
+outputs/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+wheels/
+
+# Ruff cache
+.ruff_cache/
+
+# Logs
+*.log
+
+# Test images
+test_*.jpg
+test_*.png
+
+# OS
+.DS_Store
+Thumbs.db
