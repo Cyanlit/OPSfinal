@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -5,7 +6,7 @@ from typing import Annotated
 import cv2
 import easyocr
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -20,8 +21,15 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
     EASYOCR_MODEL_STORAGE: str = "./models"
 
+    # LINE Bot
+    LINE_CHANNEL_SECRET: str = ""
+    LINE_CHANNEL_ACCESS_TOKEN: str = ""
+    OCR_SERVICE_URL: str = "http://127.0.0.1:8000"
+    MIN_CONFIDENCE: float = 0.5
+
 
 settings = Settings()
+logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="OCR Service", version="1.0.0")
 
 _reader: easyocr.Reader | None = None
@@ -412,12 +420,69 @@ def preprocess_image(image_bytes: bytes) -> tuple[np.ndarray, dict]:
     }
 
 
+def scan_image_bytes(image_bytes: bytes, min_confidence: float = 0.5) -> dict:
+    """核心 OCR 流程，供 API 與 LINE Bot 共用（避免 HTTP 自呼叫逾時）。"""
+    if not (0.0 <= min_confidence <= 1.0):
+        raise ValueError("INVALID_PARAMETER")
+    if len(image_bytes) > MAX_FILE_SIZE:
+        raise ValueError("FILE_TOO_LARGE")
+
+    try:
+        processed_img, metadata = preprocess_image(image_bytes)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raise ValueError(detail.get("error", "SCAN_FAILED")) from exc
+
+    try:
+        results = get_reader().readtext(processed_img, adjust_contrast=0.5)
+    except (RuntimeError, MemoryError) as exc:
+        raise ValueError("OCR_ENGINE_TIMEOUT") from exc
+
+    predictions = [
+        {
+            "text": text,
+            "confidence": round(float(conf), 4),
+            "bounding_box": [[int(p[0]), int(p[1])] for p in bbox],
+        }
+        for bbox, text, conf in results
+        if conf >= min_confidence
+    ]
+
+    return {
+        "success": True,
+        "metadata": metadata,
+        "predictions": predictions,
+        "grouped": _group_predictions(predictions),
+    }
+
+
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "line_configured": line_bot_service.is_configured,
     }
+
+
+@app.post("/callback")
+async def line_callback(request: Request):
+    """LINE Messaging API Webhook。"""
+    if not line_bot_service.is_configured:
+        raise HTTPException(
+            status_code=500,
+            detail="LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN 未設定。",
+        )
+
+    body = (await request.body()).decode("utf-8")
+    signature = request.headers.get("X-Line-Signature", "")
+
+    try:
+        line_bot_service.handle_webhook(body, signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return "OK"
 
 
 @app.post("/api/v1/scan")
@@ -455,33 +520,47 @@ async def scan_document(
             detail={"error": "FILE_TOO_LARGE", "message": "File exceeds 10 MB limit."},
         )
 
-    processed_img, metadata = preprocess_image(image_bytes)
-
     try:
-        results = get_reader().readtext(processed_img, adjust_contrast=0.5)
-    except (RuntimeError, MemoryError) as exc:
-        # Bug 5: catch only engine-level failures; let programming errors propagate
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "OCR_ENGINE_TIMEOUT",
-                "message": "PyTorch worker thread experienced resource starvation.",
-            },
-        ) from exc
+        return scan_image_bytes(image_bytes, min_confidence)
+    except ValueError as exc:
+        code = str(exc)
+        if code == "OCR_ENGINE_TIMEOUT":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "OCR_ENGINE_TIMEOUT",
+                    "message": "PyTorch worker thread experienced resource starvation.",
+                },
+            ) from exc
+        if code == "INVALID_PARAMETER":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "INVALID_PARAMETER", "message": "min_confidence must be between 0.0 and 1.0."},
+            ) from exc
+        if code == "FILE_TOO_LARGE":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "FILE_TOO_LARGE", "message": "File exceeds 10 MB limit."},
+            ) from exc
+        if code == "IMAGE_DECODE_FAILED":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "IMAGE_DECODE_FAILED",
+                    "message": "Cannot decode image data. The file may be corrupted.",
+                },
+            ) from exc
+        raise
 
-    predictions = [
-        {
-            "text": text,
-            "confidence": round(float(conf), 4),
-            "bounding_box": [[int(p[0]), int(p[1])] for p in bbox],
-        }
-        for bbox, text, conf in results
-        if conf >= min_confidence
-    ]
 
-    return {
-        "success": True,
-        "metadata": metadata,
-        "predictions": predictions,
-        "grouped": _group_predictions(predictions),
-    }
+from line_bot import LineBotConfig, LineBotService
+
+line_bot_service = LineBotService(
+    LineBotConfig(
+        channel_secret=settings.LINE_CHANNEL_SECRET.strip(),
+        channel_access_token=settings.LINE_CHANNEL_ACCESS_TOKEN.strip(),
+        ocr_service_url=settings.OCR_SERVICE_URL.strip(),
+        min_confidence=settings.MIN_CONFIDENCE,
+    ),
+    scan_fn=scan_image_bytes,
+)

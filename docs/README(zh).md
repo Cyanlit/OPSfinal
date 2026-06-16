@@ -7,6 +7,9 @@
 
 一個輕量化、可生產部署的 OCR 微服務核心，結合 **OpenCV 電腦視覺管線** 與 **EasyOCR（PyTorch）深度學習引擎**，實現智慧型文件數位化。
 
+> **English:** [README.md](../README.md)  
+> **團隊分工：** [teamspilt.md](teamspilt.md) · **API 合約：** [API_CONTRACT.md](API_CONTRACT.md)
+
 本服務以模組化設計為核心理念——OCR 處理邏輯獨立封裝，可作為共用後端被多種前端介面調用：
 
 | 調用方式 | 使用情境 |
@@ -88,30 +91,54 @@ OCR 引擎是整個專案的共用後端，所有調用模組皆透過 HTTP API 
 
 ## 🖥️ 調用模組 A：本地視窗介面
 
-本地視窗模組讓使用者在桌面端直接使用 OCR 功能，無需透過 Bot 或網頁。
+桌面客戶端（`gui.py`，**Engineer B**）將 OCR API 包裝成 tkinter 視窗程式，支援拖拉上傳與即時顯示辨識結果。
 
-**使用流程：**
+### 功能一覽
+
+| 功能 | 說明 |
+| :--- | :--- |
+| 圖片輸入 | 檔案選擇 + 拖曳上傳（可選 `tkinterdnd2`） |
+| 連線檢查 | 啟動時自動 `GET /health`，亦可手動測試 |
+| 掃描 | 呼叫 `POST /api/v1/scan`，可調整信心門檻 |
+| 結果顯示 | 辨識文字、複製、儲存為 `.txt` |
+| 標框預覽 | 「校正後標框」分頁顯示 bounding box |
+| 設定 | 透過 `.env` 設定 `OCR_SERVICE_URL`、`MIN_CONFIDENCE` |
+
+### 快速開始（Windows）
+
+```bash
+copy .env.example .env
+pip install -r requirements.txt
+```
+
+1. **終端機 1** — 啟動後端服務：
+   ```bash
+   start_server.bat
+   # 或：uvicorn main:app --host 127.0.0.1 --port 8000
+   ```
+2. **終端機 2** — 啟動桌面 GUI：
+   ```bash
+   start_gui.bat
+   # 或：python gui.py
+   ```
+3. 載入 `samples/` 內的測試圖或自己的照片，點擊「開始掃描」。
+
+### 使用流程
 
 ```
 使用者拖拉或選擇圖片
         │
         ▼
-本地視窗應用程式（tkinter / PyQt / Electron）
-        │  HTTP POST /api/v1/scan（連接本地或遠端服務）
+gui.py（tkinter 桌面客戶端）
+        │  GET /health  →  POST /api/v1/scan
         ▼
-OCR 核心服務
+OCR 核心服務（main.py）
         │  JSON 回傳
         ▼
-視窗介面顯示辨識文字與 Bounding Box 標注
+顯示文字、信心度、降噪資訊與標框預覽
 ```
 
-**啟動本地服務（供視窗介面連接）：**
-
-```bash
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-視窗介面預設連接 `http://127.0.0.1:8000/api/v1/scan`，可透過 `.env` 調整。
+預設連接 `http://127.0.0.1:8000`。若後端部署在遠端，請在 `.env` 修改 `OCR_SERVICE_URL`。
 
 ---
 
@@ -212,7 +239,10 @@ OCR_SERVICE_URL=http://localhost:8000
   "metadata": {
     "width": 1920,
     "height": 1080,
-    "processed_dimensions": "800x600"
+    "processed_dimensions": "800x600",
+    "noise_level": 2,
+    "noise_score": 8.5,
+    "denoising": "medium"
   },
   "predictions": [
     {
@@ -239,11 +269,31 @@ OCR_SERVICE_URL=http://localhost:8000
 | :--- | :--- |
 | 運行環境 | Python 3.10 / 3.11 / 3.12 |
 | API 層 | FastAPI + Uvicorn（ASGI） |
+| 桌面 GUI | `tkinter` + Pillow + requests |
 | 電腦視覺引擎 | `opencv-python-headless` |
 | 深度學習引擎 | `easyocr`（依賴 PyTorch） |
 | 資料結構 | `numpy` |
 | 環境管理 | `pydantic-settings` + `python-dotenv` |
-| 依賴管理 | `uv` |
+| 依賴管理 | `uv` 或 `pip` |
+
+---
+
+## 📁 專案結構
+
+```
+OPSfinal/
+├── main.py              # OCR 核心服務（Engineer A）
+├── gui.py               # 桌面 GUI 客戶端（Engineer B）
+├── start_server.bat     # 一鍵啟動後端（Windows）
+├── start_gui.bat        # 一鍵啟動 GUI（Windows）
+├── requirements.txt
+├── .env.example
+├── samples/             # 測試用樣本圖片
+└── docs/
+    ├── API_CONTRACT.md
+    ├── teamspilt.md
+    └── README(zh).md
+```
 
 ---
 
@@ -258,40 +308,53 @@ cd OPSfinal
 
 ### 2. 環境變數設定
 
-在根目錄建立 `.env` 檔案：
+複製範例檔並依需求修改：
+
+```bash
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux / macOS
+```
 
 ```env
+# OCR 核心服務（Engineer A）
 APP_ENV=development
 APP_HOST=0.0.0.0
 APP_PORT=8000
-EASYOCR_MODEL_STORAGE=/app/models
+EASYOCR_MODEL_STORAGE=./models
 
-# LINE Bot（僅使用 LINE Bot 模組時需填寫）
-LINE_CHANNEL_SECRET=
-LINE_CHANNEL_ACCESS_TOKEN=
+# 桌面 GUI 客戶端（Engineer B）
+OCR_SERVICE_URL=http://127.0.0.1:8000
+MIN_CONFIDENCE=0.5
 ```
 
-### 3. 使用 uv 安裝環境
+### 3. 安裝依賴
 
 ```bash
-# 建立虛擬環境
+# 方式 A：uv
 uv venv
-
-# 啟動（Linux / macOS）
-source .venv/bin/activate
-
-# 啟動（Windows）
-.venv\Scripts\activate
-
-# 安裝依賴
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux / macOS
 uv pip install -r requirements.txt
+
+# 方式 B：pip
+pip install -r requirements.txt
 ```
 
 ### 4. 啟動 OCR 核心服務
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+# 或：start_server.bat
 ```
+
+### 5. 啟動桌面 GUI
+
+```bash
+python gui.py
+# 或：start_gui.bat
+```
+
+可使用 `samples/` 資料夾內的圖片測試。互動式 API 文件：[http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
 
@@ -338,9 +401,13 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 | HTTP 狀態碼 | 錯誤標籤 | 觸發條件 |
 | :--- | :--- | :--- |
-| `400 Bad Request` | `INVALID_FILE_TYPE` | 檔案格式不在支援清單中。 |
-| `422 Unprocessable` | `DOCUMENT_CONTOUR_NOT_FOUND` | OpenCV 無法解析四個有效外框頂點。 |
-| `503 Service Unavailable` | `OCR_ENGINE_TIMEOUT` | PyTorch 執行執行緒發生資源競爭。 |
+| `400 Bad Request` | `INVALID_FILE_TYPE` | 不支援的圖片副檔名 |
+| `400 Bad Request` | `FILE_TOO_LARGE` | 檔案超過 10 MB |
+| `400 Bad Request` | `INVALID_PARAMETER` | `min_confidence` 不在 `0.0`–`1.0` |
+| `422 Unprocessable` | `IMAGE_DECODE_FAILED` | 圖片損壞或無法解碼 |
+| `503 Service Unavailable` | `OCR_ENGINE_TIMEOUT` | PyTorch 執行緒資源不足 |
+
+> 若無法偵測文件四邊形，服務會**改用原圖繼續 OCR**，不再回傳 `422`。
 
 ---
 

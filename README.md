@@ -7,6 +7,9 @@
 
 A lightweight, production-ready OCR microservice combining an **OpenCV computer vision pipeline** with an **EasyOCR (PyTorch) deep learning engine** for intelligent document digitization.
 
+> **中文說明：** [docs/README(zh).md](docs/README(zh).md)  
+> **Team split:** [docs/teamspilt.md](docs/teamspilt.md) · **API contract:** [docs/API_CONTRACT.md](docs/API_CONTRACT.md)
+
 Built around a modular design philosophy — the OCR processing logic is encapsulated as a standalone shared backend, callable by multiple frontend interfaces:
 
 | Client Type | Use Case |
@@ -88,30 +91,54 @@ Each image submitted to the service is processed through the following sequentia
 
 ## 🖥️ Client Module A: Local Desktop GUI
 
-The desktop module lets users access OCR functionality directly from their machine, without going through a bot or browser.
+The desktop client (`gui.py`, **Engineer B**) wraps the OCR API into a tkinter application for drag-and-drop scanning on Windows/macOS/Linux.
 
-**User Flow:**
+### Features
+
+| Feature | Description |
+| :--- | :--- |
+| Image input | File picker + drag-and-drop (`tkinterdnd2`, optional) |
+| Health check | Auto `GET /health` on startup; manual re-test button |
+| Scan | `POST /api/v1/scan` with adjustable confidence slider |
+| Results | Extracted text panel with copy / save to `.txt` |
+| Bounding boxes | Processed-image preview tab with labeled boxes |
+| Configuration | `OCR_SERVICE_URL` and `MIN_CONFIDENCE` via `.env` |
+
+### Quick Start (Windows)
+
+```bash
+copy .env.example .env
+pip install -r requirements.txt
+```
+
+1. **Terminal 1** — start the OCR backend:
+   ```bash
+   start_server.bat
+   # or: uvicorn main:app --host 127.0.0.1 --port 8000
+   ```
+2. **Terminal 2** — start the desktop GUI:
+   ```bash
+   start_gui.bat
+   # or: python gui.py
+   ```
+3. Load an image from `samples/` or your own file, then click **Scan**.
+
+### User Flow
 
 ```
 User drags or selects an image file
               │
               ▼
-Desktop Application (tkinter / PyQt / Electron)
-              │  HTTP POST /api/v1/scan (local or remote service)
+gui.py (tkinter desktop client)
+              │  GET /health  →  POST /api/v1/scan
               ▼
-OCR Core Service
+OCR Core Service (main.py)
               │  JSON response
               ▼
-GUI displays extracted text and bounding box annotations
+GUI shows text, confidence, denoising metadata, and bounding boxes
 ```
 
-**Start the local service (for the GUI to connect to):**
-
-```bash
-uvicorn main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-The GUI connects to `http://127.0.0.1:8000/api/v1/scan` by default. This can be overridden via `.env`.
+The GUI connects to `http://127.0.0.1:8000` by default. Override with `OCR_SERVICE_URL` in `.env` when pointing to a remote deployment.
 
 ---
 
@@ -212,7 +239,10 @@ Used by platform load balancers (Render, Kubernetes, etc.) to monitor container 
   "metadata": {
     "width": 1920,
     "height": 1080,
-    "processed_dimensions": "800x600"
+    "processed_dimensions": "800x600",
+    "noise_level": 2,
+    "noise_score": 8.5,
+    "denoising": "medium"
   },
   "predictions": [
     {
@@ -239,11 +269,31 @@ Interactive API docs (development): [http://localhost:8000/docs](http://localhos
 | :--- | :--- |
 | Runtime | Python 3.10 / 3.11 / 3.12 |
 | API Layer | FastAPI + Uvicorn (ASGI) |
+| Desktop GUI | `tkinter` + Pillow + requests |
 | Computer Vision Engine | `opencv-python-headless` |
 | Deep Learning Engine | `easyocr` (PyTorch-backed) |
 | Data Structures | `numpy` |
 | Environment Management | `pydantic-settings` + `python-dotenv` |
-| Dependency Management | `uv` |
+| Dependency Management | `uv` or `pip` |
+
+---
+
+## 📁 Project Structure
+
+```
+OPSfinal/
+├── main.py              # OCR core service (Engineer A)
+├── gui.py               # Desktop GUI client (Engineer B)
+├── start_server.bat     # One-click backend launcher (Windows)
+├── start_gui.bat        # One-click GUI launcher (Windows)
+├── requirements.txt
+├── .env.example
+├── samples/             # Test images
+└── docs/
+    ├── API_CONTRACT.md
+    ├── teamspilt.md
+    └── README(zh).md
+```
 
 ---
 
@@ -258,40 +308,53 @@ cd OPSfinal
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the project root:
+Copy the example file and edit as needed:
+
+```bash
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux / macOS
+```
 
 ```env
+# OCR Core Service (Engineer A)
 APP_ENV=development
 APP_HOST=0.0.0.0
 APP_PORT=8000
-EASYOCR_MODEL_STORAGE=/app/models
+EASYOCR_MODEL_STORAGE=./models
 
-# LINE Bot (only required when using the LINE Bot module)
-LINE_CHANNEL_SECRET=
-LINE_CHANNEL_ACCESS_TOKEN=
+# Desktop GUI Client (Engineer B)
+OCR_SERVICE_URL=http://127.0.0.1:8000
+MIN_CONFIDENCE=0.5
 ```
 
-### 3. Install Dependencies with uv
+### 3. Install Dependencies
 
 ```bash
-# Create virtual environment
+# Option A: uv
 uv venv
-
-# Activate (Linux / macOS)
-source .venv/bin/activate
-
-# Activate (Windows)
-.venv\Scripts\activate
-
-# Install dependencies
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux / macOS
 uv pip install -r requirements.txt
+
+# Option B: pip
+pip install -r requirements.txt
 ```
 
 ### 4. Start the OCR Core Service
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+# or: start_server.bat
 ```
+
+### 5. Start the Desktop GUI
+
+```bash
+python gui.py
+# or: start_gui.bat
+```
+
+Test with sample images in `samples/`. Interactive API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
 
@@ -338,9 +401,13 @@ All errors conform to the RFC 7807 Problem Details standard:
 
 | HTTP Status | Error Tag | Trigger Condition |
 | :--- | :--- | :--- |
-| `400 Bad Request` | `INVALID_FILE_TYPE` | File extension is not a recognized image format. |
-| `422 Unprocessable` | `DOCUMENT_CONTOUR_NOT_FOUND` | OpenCV cannot resolve four valid corner vertices. |
-| `503 Service Unavailable` | `OCR_ENGINE_TIMEOUT` | PyTorch worker thread experiences resource starvation. |
+| `400 Bad Request` | `INVALID_FILE_TYPE` | Unsupported file extension |
+| `400 Bad Request` | `FILE_TOO_LARGE` | File exceeds 10 MB |
+| `400 Bad Request` | `INVALID_PARAMETER` | `min_confidence` not in `0.0`–`1.0` |
+| `422 Unprocessable` | `IMAGE_DECODE_FAILED` | Corrupted or unreadable image bytes |
+| `503 Service Unavailable` | `OCR_ENGINE_TIMEOUT` | PyTorch worker thread experiences resource starvation |
+
+> If no document quadrilateral is detected, the service **falls back to the original image** and continues OCR instead of returning `422`.
 
 ---
 
