@@ -509,7 +509,6 @@ async def scan_document(
     file: Annotated[UploadFile, File()],
     min_confidence: Annotated[float, Form()] = 0.5,
 ):
-    # Bug 3: validate min_confidence is in [0, 1]
     if not (0.0 <= min_confidence <= 1.0):
         raise HTTPException(
             status_code=400,
@@ -526,7 +525,6 @@ async def scan_document(
             },
         )
 
-    # Bug 2: pre-check Content-Length header before reading into memory
     if file.size is not None and file.size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
@@ -544,7 +542,6 @@ async def scan_document(
     try:
         results = get_reader().readtext(processed_img, adjust_contrast=0.5)
     except (RuntimeError, MemoryError) as exc:
-        # Bug 5: catch only engine-level failures; let programming errors propagate
         raise HTTPException(
             status_code=503,
             detail={

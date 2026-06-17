@@ -21,8 +21,6 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import ImageMessageContent, MessageEvent, TextMessageContent
 
-from prediction_utils import sort_predictions_reading_order
-
 logger = logging.getLogger(__name__)
 
 HELP_TEXT = (
@@ -160,16 +158,27 @@ class LineBotService:
         return f"掃描失敗（HTTP {response.status_code}）"
 
     def _format_scan_reply(self, result: dict) -> str:
-        predictions = sort_predictions_reading_order(result.get("predictions", []))
-        if not predictions:
+        grouped = result.get("grouped", {})
+        orientation = grouped.get("orientation", "row")
+
+        if orientation == "column":
+            entries = grouped.get("columns", [])
+            orient_label = "直排（列）"
+        else:
+            entries = grouped.get("rows", [])
+            orient_label = "橫排（行）" if orientation == "row" else "混合（以行為主）"
+
+        if not entries:
             return "未辨識到文字，請換張更清晰的照片，或調低 MIN_CONFIDENCE 再試。"
 
-        lines = [pred["text"] for pred in predictions if pred.get("text", "").strip()]
-        text = "\n".join(lines)
+        text = "\n".join(e["text"] for e in entries if e.get("text", "").strip())
+        if not text.strip():
+            return "未辨識到文字，請換張更清晰的照片，或調低 MIN_CONFIDENCE 再試。"
+
         meta = result.get("metadata", {})
         processed = meta.get("processed_dimensions", "-")
         denoise = meta.get("denoising")
-        header = f"✅ 掃描完成（處理尺寸 {processed}"
+        header = f"✅ 掃描完成（{orient_label}，處理尺寸 {processed}"
         if denoise:
             header += f"，降噪 {denoise}"
         header += "）\n\n"

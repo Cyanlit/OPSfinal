@@ -529,7 +529,7 @@ class OCRApp:
             entries = self._grouped.get("rows", [])
             orient_label = "方向：混合（以行為主）"
 
-        grouped_text = "\n".join(e["text"] for e in entries) if entries else "（無分組結果）"
+        grouped_text = "\n".join(e["text"] for e in entries if e.get("text", "").strip()) if entries else "（無分組結果）"
         self._set_grouped_text(grouped_text, orient_label)
 
         self._progress.stop()
