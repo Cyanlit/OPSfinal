@@ -37,8 +37,8 @@ class OCRApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("智慧文件掃描 — 桌面客戶端")
-        self.root.geometry("1280x760")
-        self.root.minsize(900, 560)
+        self.root.geometry("960x620")
+        self.root.minsize(760, 480)
         self.root.configure(bg="#f0f2f5")
 
         self._image_path: Path | None = None
@@ -48,6 +48,7 @@ class OCRApp:
         self._photo_processed: ImageTk.PhotoImage | None = None
         self._predictions: list[dict] = []
         self._metadata: dict = {}
+        self._grouped: dict = {}
         self._drag_drop_enabled = False
 
         self._build_ui()
@@ -119,37 +120,55 @@ class OCRApp:
         self._canvas_processed.pack(fill=tk.BOTH, expand=True)
         self._canvas_processed.bind("<Configure>", lambda _e: self._redraw_processed())
 
-        hint = "拖曳圖片到左側，或點擊原圖區域選擇檔案"
-        if not self._drag_drop_enabled:
-            hint = "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
-        self._canvas_original.create_text(
-            360,
-            240,
-            text=hint,
-            fill="#666666",
-            font=("Microsoft JhengHei UI", 12),
-            tags="placeholder",
+        self._hint_text = (
+            "拖曳圖片到左側，或點擊原圖區域選擇檔案"
+            if self._drag_drop_enabled
+            else "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
         )
 
         right = ttk.LabelFrame(pane, text="辨識結果", padding=4)
         pane.add(right, weight=2)
 
         self._summary_var = tk.StringVar(value="尚未掃描")
-        ttk.Label(right, textvariable=self._summary_var, foreground="#444444").pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(right, textvariable=self._summary_var, foreground="#444444").pack(anchor=tk.W, pady=(0, 4))
 
-        self._text_box = scrolledtext.ScrolledText(
-            right,
+        right_pane = ttk.PanedWindow(right, orient=tk.VERTICAL)
+        right_pane.pack(fill=tk.BOTH, expand=True)
+
+        raw_frame = ttk.LabelFrame(right_pane, text="原始結果", padding=4)
+        right_pane.add(raw_frame, weight=1)
+
+        self._raw_text_box = scrolledtext.ScrolledText(
+            raw_frame,
             wrap=tk.WORD,
             font=("Microsoft JhengHei UI", 11),
             state="disabled",
         )
-        self._text_box.pack(fill=tk.BOTH, expand=True)
+        self._raw_text_box.pack(fill=tk.BOTH, expand=True)
+
+        grouped_frame = ttk.LabelFrame(right_pane, text="套用行／列結果", padding=4)
+        right_pane.add(grouped_frame, weight=1)
+
+        self._grouped_orient_var = tk.StringVar(value="")
+        ttk.Label(grouped_frame, textvariable=self._grouped_orient_var, foreground="#555555").pack(anchor=tk.W)
+
+        self._grouped_text_box = scrolledtext.ScrolledText(
+            grouped_frame,
+            wrap=tk.WORD,
+            font=("Microsoft JhengHei UI", 11),
+            state="disabled",
+        )
+        self._grouped_text_box.pack(fill=tk.BOTH, expand=True)
 
     def _build_status_bar(self) -> None:
         bar = ttk.Frame(self.root, padding=(10, 6))
         bar.pack(fill=tk.X)
         self._status_var = tk.StringVar(value="就緒")
         ttk.Label(bar, textvariable=self._status_var).pack(side=tk.LEFT)
+        self._progress = ttk.Progressbar(
+            bar, mode="indeterminate", length=160
+        )
+        self._progress.pack(side=tk.LEFT, padx=(12, 0))
 
     def _enable_drag_drop(self) -> None:
         try:
@@ -208,10 +227,12 @@ class OCRApp:
         self._processed_image = None
         self._predictions = []
         self._metadata = {}
+        self._grouped = {}
         self._scan_btn.configure(state="normal")
         self._status_var.set(f"已載入：{path.name}")
         self._summary_var.set(f"原圖尺寸：{image.width} x {image.height}")
-        self._set_text_content("")
+        self._set_raw_text("")
+        self._set_grouped_text("", "")
         self._preview_tabs.select(0)
         self._redraw_original()
         self._redraw_processed()
@@ -224,13 +245,20 @@ class OCRApp:
         return ImageTk.PhotoImage(display)
 
     def _redraw_original(self) -> None:
-        if self._original_image is None:
-            return
-
-        self._photo_original = self._fit_image_to_canvas(self._original_image, self._canvas_original)
         cw = self._canvas_original.winfo_width() or 700
         ch = self._canvas_original.winfo_height() or 500
         self._canvas_original.delete("all")
+        if self._original_image is None:
+            self._canvas_original.create_text(
+                cw // 2, ch // 2,
+                text=self._hint_text,
+                fill="#666666",
+                font=("Microsoft JhengHei UI", 9),
+                tags="placeholder",
+            )
+            return
+
+        self._photo_original = self._fit_image_to_canvas(self._original_image, self._canvas_original)
         self._canvas_original.create_image(cw // 2, ch // 2, anchor=tk.CENTER, image=self._photo_original)
 
     def _build_processed_image(self) -> Image.Image | None:
@@ -312,6 +340,7 @@ class OCRApp:
 
         self._scan_btn.configure(state="disabled")
         self._status_var.set("掃描中，首次執行可能較久，請稍候…")
+        self._progress.start(12)
         threading.Thread(target=self._do_scan, daemon=True).start()
 
     def _do_scan(self) -> None:
@@ -369,19 +398,37 @@ class OCRApp:
     def _on_scan_done(self, result: dict) -> None:
         self._predictions = result.get("predictions", [])
         self._metadata = result.get("metadata", {})
+        self._grouped = result.get("grouped", {})
         self._processed_image = self._build_processed_image()
 
+        # 原始結果
         plain_lines = [pred["text"] for pred in self._predictions]
         detail_lines = [f'[{pred["confidence"]:.4f}] {pred["text"]}' for pred in self._predictions]
         plain_text = "\n".join(plain_lines)
         detail_text = "\n".join(detail_lines)
 
-        self._set_text_content(plain_text if plain_text else "（未辨識到文字，可試著調低信心門檻或換張更清晰的圖片）")
-        self._text_box.configure(state="normal")
+        raw_content = plain_text if plain_text else "（未辨識到文字，可試著調低信心門檻或換張更清晰的圖片）"
+        self._set_raw_text(raw_content)
         if detail_lines:
-            self._text_box.insert(tk.END, "\n\n---\n詳細結果\n---\n")
-            self._text_box.insert(tk.END, detail_text)
-        self._text_box.configure(state="disabled")
+            self._raw_text_box.configure(state="normal")
+            self._raw_text_box.insert(tk.END, "\n\n---\n詳細結果\n---\n")
+            self._raw_text_box.insert(tk.END, detail_text)
+            self._raw_text_box.configure(state="disabled")
+
+        # 套用行／列結果
+        orientation = self._grouped.get("orientation", "row")
+        if orientation == "column":
+            entries = self._grouped.get("columns", [])
+            orient_label = "方向：直排（列）"
+        elif orientation == "row":
+            entries = self._grouped.get("rows", [])
+            orient_label = "方向：橫排（行）"
+        else:
+            entries = self._grouped.get("rows", [])
+            orient_label = "方向：混合（以行為主）"
+
+        grouped_text = "\n".join(e["text"] for e in entries) if entries else "（無分組結果）"
+        self._set_grouped_text(grouped_text, orient_label)
 
         self._redraw_processed()
         self._preview_tabs.select(1)
@@ -392,21 +439,30 @@ class OCRApp:
         self._summary_var.set(
             f"共 {len(self._predictions)} 筆結果 | 原圖 {original_size} | 校正後 {processed_size}"
         )
+        self._progress.stop()
         self._status_var.set("掃描完成")
 
     def _on_scan_error(self, message: str) -> None:
+        self._progress.stop()
         self._scan_btn.configure(state="normal")
         self._status_var.set("掃描失敗")
         messagebox.showerror("掃描失敗", message)
 
-    def _set_text_content(self, content: str) -> None:
-        self._text_box.configure(state="normal")
-        self._text_box.delete("1.0", tk.END)
-        self._text_box.insert("1.0", content)
-        self._text_box.configure(state="disabled")
+    def _set_raw_text(self, content: str) -> None:
+        self._raw_text_box.configure(state="normal")
+        self._raw_text_box.delete("1.0", tk.END)
+        self._raw_text_box.insert("1.0", content)
+        self._raw_text_box.configure(state="disabled")
+
+    def _set_grouped_text(self, content: str, orient_label: str = "") -> None:
+        self._grouped_orient_var.set(orient_label)
+        self._grouped_text_box.configure(state="normal")
+        self._grouped_text_box.delete("1.0", tk.END)
+        self._grouped_text_box.insert("1.0", content)
+        self._grouped_text_box.configure(state="disabled")
 
     def _copy_text(self) -> None:
-        content = self._text_box.get("1.0", tk.END).strip()
+        content = self._raw_text_box.get("1.0", tk.END).strip()
         if not content:
             messagebox.showinfo("複製文字", "目前沒有可複製的內容。")
             return
@@ -415,7 +471,7 @@ class OCRApp:
         self._status_var.set("已複製辨識文字")
 
     def _save_text(self) -> None:
-        content = self._text_box.get("1.0", tk.END).strip()
+        content = self._raw_text_box.get("1.0", tk.END).strip()
         if not content:
             messagebox.showinfo("儲存文字", "目前沒有可儲存的內容。")
             return
