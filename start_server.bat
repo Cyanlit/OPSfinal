@@ -3,7 +3,8 @@ setlocal
 cd /d "%~dp0"
 
 echo Starting OCR Core Service (Engineer A)...
-echo API docs: http://127.0.0.1:8000/docs
+echo API docs : http://127.0.0.1:8000/docs
+echo LINE hook: http://127.0.0.1:8000/callback  (use start_line.bat for ngrok)
 echo.
 
 set "PYTHON=py"

@@ -1,6 +1,3 @@
-import base64
-import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -8,7 +5,7 @@ from typing import Annotated
 import cv2
 import easyocr
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
@@ -29,8 +26,15 @@ class Settings(BaseSettings):
     EASYOCR_MODEL_STORAGE: str = "./models"
     ANTHROPIC_API_KEY: str = ""
 
+    # LINE Bot
+    LINE_CHANNEL_SECRET: str = ""
+    LINE_CHANNEL_ACCESS_TOKEN: str = ""
+    OCR_SERVICE_URL: str = "http://127.0.0.1:8000"
+    MIN_CONFIDENCE: float = 0.5
+
 
 settings = Settings()
+logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="OCR Service", version="1.0.0")
 
 _reader: easyocr.Reader | None = None
@@ -421,12 +425,69 @@ def preprocess_image(image_bytes: bytes) -> tuple[np.ndarray, dict]:
     }
 
 
+def scan_image_bytes(image_bytes: bytes, min_confidence: float = 0.5) -> dict:
+    """核心 OCR 流程，供 API 與 LINE Bot 共用（避免 HTTP 自呼叫逾時）。"""
+    if not (0.0 <= min_confidence <= 1.0):
+        raise ValueError("INVALID_PARAMETER")
+    if len(image_bytes) > MAX_FILE_SIZE:
+        raise ValueError("FILE_TOO_LARGE")
+
+    try:
+        processed_img, metadata = preprocess_image(image_bytes)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        raise ValueError(detail.get("error", "SCAN_FAILED")) from exc
+
+    try:
+        results = get_reader().readtext(processed_img, adjust_contrast=0.5)
+    except (RuntimeError, MemoryError) as exc:
+        raise ValueError("OCR_ENGINE_TIMEOUT") from exc
+
+    predictions = [
+        {
+            "text": text,
+            "confidence": round(float(conf), 4),
+            "bounding_box": [[int(p[0]), int(p[1])] for p in bbox],
+        }
+        for bbox, text, conf in results
+        if conf >= min_confidence
+    ]
+
+    return {
+        "success": True,
+        "metadata": metadata,
+        "predictions": predictions,
+        "grouped": _group_predictions(predictions),
+    }
+
+
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "line_configured": line_bot_service.is_configured,
     }
+
+
+@app.post("/callback")
+async def line_callback(request: Request):
+    """LINE Messaging API Webhook。"""
+    if not line_bot_service.is_configured:
+        raise HTTPException(
+            status_code=500,
+            detail="LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN 未設定。",
+        )
+
+    body = (await request.body()).decode("utf-8")
+    signature = request.headers.get("X-Line-Signature", "")
+
+    try:
+        line_bot_service.handle_webhook(body, signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return "OK"
 
 
 @app.post("/api/v1/scan")
@@ -491,165 +552,6 @@ async def scan_document(
     return {
         "success": True,
         "metadata": metadata,
-        "predictions": predictions,
-        "grouped": _group_predictions(predictions),
-    }
-
-
-@app.post("/api/v1/scan/claude")
-async def scan_document_claude(
-    file: Annotated[UploadFile, File()],
-    min_confidence: Annotated[float, Form()] = 0.5,
-):
-    if not (0.0 <= min_confidence <= 1.0):
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "INVALID_PARAMETER", "message": "min_confidence must be between 0.0 and 1.0."},
-        )
-
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "INVALID_FILE_TYPE",
-                "message": "File extension is not a recognized image format.",
-            },
-        )
-
-    if file.size is not None and file.size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "FILE_TOO_LARGE", "message": "File exceeds 10 MB limit."},
-        )
-    image_bytes = await file.read()
-    if len(image_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "FILE_TOO_LARGE", "message": "File exceeds 10 MB limit."},
-        )
-
-    if _anthropic is None:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "CLAUDE_NOT_INSTALLED", "message": "anthropic package is not installed."},
-        )
-    if not settings.ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "CLAUDE_API_NOT_CONFIGURED", "message": "ANTHROPIC_API_KEY is not set."},
-        )
-
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "IMAGE_DECODE_FAILED",
-                "message": "Cannot decode image data. The file may be corrupted.",
-            },
-        )
-    img_h, img_w = img.shape[:2]
-
-    media_type_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
-    media_type = media_type_map.get(suffix, "image/jpeg")
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    claude = _anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-    ocr_prompt = (
-        "Extract every visible text region from this image.\n"
-        "Return ONLY a JSON array — no markdown, no code fences, no explanation.\n"
-        "Each element must have exactly these keys:\n"
-        '  "text"       : the exact text string\n'
-        '  "confidence" : your confidence from 0.0 to 1.0\n'
-        '  "x_ratio"    : left edge as fraction of image width  (0.0–1.0)\n'
-        '  "y_ratio"    : top  edge as fraction of image height (0.0–1.0)\n'
-        '  "w_ratio"    : region width  as fraction of image width  (0.0–1.0)\n'
-        '  "h_ratio"    : region height as fraction of image height (0.0–1.0)\n'
-        "If no text is found return an empty array: []"
-    )
-
-    try:
-        response = claude.messages.create(
-            model="claude-opus-4-8",
-            max_tokens=4096,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": ocr_prompt},
-                ],
-            }],
-        )
-    except (_anthropic.APIError, _anthropic.APIConnectionError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "CLAUDE_API_ERROR", "message": str(exc)},
-        ) from exc
-
-    response_text = next(
-        (block.text for block in response.content if block.type == "text"), ""
-    )
-
-    # Strip markdown code fences that Claude may wrap JSON in
-    stripped = response_text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[^\n]*\n?", "", stripped)
-        stripped = re.sub(r"\n?```$", "", stripped.rstrip())
-
-    try:
-        items = json.loads(stripped)
-        if not isinstance(items, list):
-            items = []
-    except json.JSONDecodeError:
-        match = re.search(r"\[.*\]", stripped, re.DOTALL)
-        try:
-            items = json.loads(match.group()) if match else []
-        except (json.JSONDecodeError, AttributeError):
-            items = []
-
-    predictions = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            confidence = float(item.get("confidence", 1.0))
-        except (TypeError, ValueError):
-            confidence = 1.0
-        if confidence < min_confidence:
-            continue
-        text = str(item.get("text", "")).strip()
-        if not text:
-            continue
-        x = int(float(item.get("x_ratio", 0.0)) * img_w)
-        y = int(float(item.get("y_ratio", 0.0)) * img_h)
-        bw = int(float(item.get("w_ratio", 0.0)) * img_w)
-        bh = int(float(item.get("h_ratio", 0.0)) * img_h)
-        predictions.append({
-            "text": text,
-            "confidence": round(confidence, 4),
-            "bounding_box": [[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]],
-        })
-
-    return {
-        "success": True,
-        "metadata": {
-            "width": img_w,
-            "height": img_h,
-            "processed_dimensions": f"{img_w}x{img_h}",
-            "noise_level": 0,
-            "noise_score": 0.0,
-            "denoising": "none",
-        },
         "predictions": predictions,
         "grouped": _group_predictions(predictions),
     }

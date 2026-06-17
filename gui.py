@@ -18,10 +18,28 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+from prediction_utils import sort_predictions_reading_order
+
 DEFAULT_SERVICE_URL = os.getenv("OCR_SERVICE_URL", "http://127.0.0.1:8000").strip()
 DEFAULT_MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.5"))
 ALLOWED_SUFFIXES = {".png", ".jpg", ".jpeg"}
 SCAN_TIMEOUT = 120
+
+ERROR_MESSAGES: dict[str, str] = {
+    "INVALID_FILE_TYPE": "不支援的圖片格式，請使用 PNG 或 JPEG。",
+    "FILE_TOO_LARGE": "檔案超過 10 MB 上限，請壓縮或換一張較小的圖片。",
+    "IMAGE_DECODE_FAILED": "無法讀取圖片，檔案可能已損壞。",
+    "INVALID_PARAMETER": "信心門檻必須介於 0.0 到 1.0 之間。",
+    "DOCUMENT_CONTOUR_NOT_FOUND": "無法偵測文件邊界，請確認拍攝角度與光線。",
+    "OCR_ENGINE_TIMEOUT": "OCR 引擎忙碌或記憶體不足，請稍後再試。",
+}
+
+DENOISE_LABELS: dict[str, str] = {
+    "none": "無",
+    "light": "輕度",
+    "medium": "中度",
+    "heavy": "重度",
+}
 
 
 def create_root() -> tk.Tk:
@@ -51,8 +69,9 @@ class OCRApp:
         self._grouped: dict = {}
         self._drag_drop_enabled = False
 
-        self._build_ui()
         self._enable_drag_drop()
+        self._build_ui()
+        self.root.after(200, self._check_health_on_startup)
 
     def _build_ui(self) -> None:
         self._build_toolbar()
@@ -69,7 +88,9 @@ class OCRApp:
         ttk.Label(row1, text="服務位址").pack(side=tk.LEFT)
         self._url_var = tk.StringVar(value=DEFAULT_SERVICE_URL)
         ttk.Entry(row1, textvariable=self._url_var, width=46).pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Button(row1, text="測試連線", command=self._check_health).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="測試連線", command=lambda: self._check_health(show_dialog=True)).pack(
+            side=tk.LEFT, padx=2
+        )
 
         row2 = ttk.Frame(toolbar)
         row2.pack(fill=tk.X, pady=(8, 0))
@@ -113,17 +134,24 @@ class OCRApp:
 
         self._canvas_original = tk.Canvas(original_tab, bg="#d9dde3", highlightthickness=0, cursor="hand2")
         self._canvas_original.pack(fill=tk.BOTH, expand=True)
-        self._canvas_original.bind("<Configure>", lambda _e: self._redraw_original())
+        self._canvas_original.bind("<Configure>", self._on_original_canvas_configure)
         self._canvas_original.bind("<Button-1>", lambda _e: self._pick_file())
+        self._register_drop_target()
 
         self._canvas_processed = tk.Canvas(processed_tab, bg="#ffffff", highlightthickness=0)
         self._canvas_processed.pack(fill=tk.BOTH, expand=True)
         self._canvas_processed.bind("<Configure>", lambda _e: self._redraw_processed())
 
-        self._hint_text = (
-            "拖曳圖片到左側，或點擊原圖區域選擇檔案"
-            if self._drag_drop_enabled
-            else "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
+        hint = "拖曳圖片到左側，或點擊原圖區域選擇檔案"
+        if not self._drag_drop_enabled:
+            hint = "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
+        self._canvas_original.create_text(
+            360,
+            240,
+            text=hint,
+            fill="#666666",
+            font=("Microsoft JhengHei UI", 12),
+            tags="placeholder",
         )
 
         right = ttk.LabelFrame(pane, text="辨識結果", padding=4)
@@ -174,11 +202,41 @@ class OCRApp:
         try:
             from tkinterdnd2 import DND_FILES
 
-            self._canvas_original.drop_target_register(DND_FILES)
-            self._canvas_original.dnd_bind("<<Drop>>", self._on_drop)
             self._drag_drop_enabled = True
+            self._dnd_files = DND_FILES
         except Exception:
             self._drag_drop_enabled = False
+            self._dnd_files = None
+
+    def _register_drop_target(self) -> None:
+        if not self._drag_drop_enabled or self._dnd_files is None:
+            return
+        try:
+            self._canvas_original.drop_target_register(self._dnd_files)
+            self._canvas_original.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            self._drag_drop_enabled = False
+
+    def _update_drop_hint(self) -> None:
+        if self._original_image is not None:
+            return
+
+        self._canvas_original.delete("placeholder")
+        hint = (
+            "拖曳圖片到左側，或點擊原圖區域選擇檔案"
+            if self._drag_drop_enabled
+            else "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
+        )
+        cw = self._canvas_original.winfo_width() or 700
+        ch = self._canvas_original.winfo_height() or 500
+        self._canvas_original.create_text(
+            cw // 2,
+            ch // 2,
+            text=hint,
+            fill="#666666",
+            font=("Microsoft JhengHei UI", 12),
+            tags="placeholder",
+        )
 
     def _update_confidence_label(self, _value: str = "") -> None:
         self._confidence_label.configure(text=f"{self._confidence_var.get():.2f}")
@@ -243,6 +301,11 @@ class OCRApp:
         display = image.copy()
         display.thumbnail((cw, ch), Image.LANCZOS)
         return ImageTk.PhotoImage(display)
+
+    def _on_original_canvas_configure(self, _event: tk.Event) -> None:
+        if self._original_image is None:
+            self._update_drop_hint()
+        self._redraw_original()
 
     def _redraw_original(self) -> None:
         cw = self._canvas_original.winfo_width() or 700
@@ -309,30 +372,44 @@ class OCRApp:
     def _service_base_url(self) -> str:
         return self._url_var.get().strip().rstrip("/")
 
-    def _check_health(self) -> None:
+    def _check_health_on_startup(self) -> None:
+        self._check_health(show_dialog=False)
+
+    def _check_health(self, show_dialog: bool = True) -> None:
         url = f"{self._service_base_url()}/health"
         self._status_var.set("正在測試連線…")
-        threading.Thread(target=self._do_health_check, args=(url,), daemon=True).start()
+        threading.Thread(
+            target=self._do_health_check,
+            args=(url, show_dialog),
+            daemon=True,
+        ).start()
 
-    def _do_health_check(self, url: str) -> None:
+    def _do_health_check(self, url: str, show_dialog: bool) -> None:
         try:
             resp = requests.get(url, timeout=5)
             resp.raise_for_status()
             payload = resp.json()
             status = payload.get("status", "unknown")
-            self.root.after(0, self._on_health_ok, f"連線成功：{status}")
+            self.root.after(0, self._on_health_ok, f"服務已連線（{status}）", show_dialog)
         except requests.exceptions.ConnectionError:
-            self.root.after(0, self._on_health_fail, f"無法連線到\n{url}\n\n請確認 Engineer A 的服務是否已啟動。")
+            self.root.after(
+                0,
+                self._on_health_fail,
+                f"無法連線到 {url}\n請先執行 start_server.bat 或 uvicorn main:app --port 8000",
+                show_dialog,
+            )
         except Exception as exc:
-            self.root.after(0, self._on_health_fail, str(exc))
+            self.root.after(0, self._on_health_fail, str(exc), show_dialog)
 
-    def _on_health_ok(self, message: str) -> None:
+    def _on_health_ok(self, message: str, show_dialog: bool) -> None:
         self._status_var.set(message)
-        messagebox.showinfo("連線測試", message)
+        if show_dialog:
+            messagebox.showinfo("連線測試", message)
 
-    def _on_health_fail(self, message: str) -> None:
-        self._status_var.set("連線失敗")
-        messagebox.showerror("連線測試", message)
+    def _on_health_fail(self, message: str, show_dialog: bool) -> None:
+        self._status_var.set(f"服務未連線 — {message.splitlines()[0]}")
+        if show_dialog:
+            messagebox.showerror("連線測試", message)
 
     def _start_scan(self) -> None:
         if not self._image_path:
@@ -388,17 +465,39 @@ class OCRApp:
             detail = response.json().get("detail", {})
             if isinstance(detail, dict):
                 tag = detail.get("error", "HTTP_ERROR")
+                friendly = ERROR_MESSAGES.get(tag)
                 msg = detail.get("message", response.text)
+                if friendly:
+                    return f"{friendly}\n\n（{tag}）"
                 return f"錯誤代碼：{tag}\n\n{msg}"
         except Exception:
             pass
 
         return f"HTTP {response.status_code}\n\n{response.text}"
 
+    def _format_scan_summary(self, prediction_count: int) -> str:
+        width = self._metadata.get("width")
+        height = self._metadata.get("height")
+        processed_size = self._metadata.get("processed_dimensions", "-")
+
+        parts = [f"共 {prediction_count} 筆結果"]
+        if width and height:
+            parts.append(f"原圖 {width} x {height}")
+        parts.append(f"處理後 {processed_size}")
+
+        denoise_key = self._metadata.get("denoising")
+        if denoise_key:
+            denoise_label = DENOISE_LABELS.get(str(denoise_key), str(denoise_key))
+            noise_score = self._metadata.get("noise_score")
+            if noise_score is not None:
+                parts.append(f"降噪 {denoise_label}（分數 {noise_score}）")
+            else:
+                parts.append(f"降噪 {denoise_label}")
+
+        return " | ".join(parts)
+
     def _on_scan_done(self, result: dict) -> None:
-        self._predictions = result.get("predictions", [])
         self._metadata = result.get("metadata", {})
-        self._grouped = result.get("grouped", {})
         self._processed_image = self._build_processed_image()
 
         # 原始結果
@@ -439,7 +538,6 @@ class OCRApp:
         self._summary_var.set(
             f"共 {len(self._predictions)} 筆結果 | 原圖 {original_size} | 校正後 {processed_size}"
         )
-        self._progress.stop()
         self._status_var.set("掃描完成")
 
     def _on_scan_error(self, message: str) -> None:
