@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -7,6 +8,8 @@ import easyocr
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from line_bot import LineBotConfig, LineBotService
 
 try:
     import anthropic as _anthropic
@@ -459,6 +462,17 @@ def scan_image_bytes(image_bytes: bytes, min_confidence: float = 0.5) -> dict:
         "predictions": predictions,
         "grouped": _group_predictions(predictions),
     }
+
+
+line_bot_service = LineBotService(
+    config=LineBotConfig(
+        channel_secret=settings.LINE_CHANNEL_SECRET,
+        channel_access_token=settings.LINE_CHANNEL_ACCESS_TOKEN,
+        ocr_service_url=settings.OCR_SERVICE_URL,
+        min_confidence=settings.MIN_CONFIDENCE,
+    ),
+    scan_fn=scan_image_bytes,
+)
 
 
 @app.get("/health")

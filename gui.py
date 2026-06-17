@@ -145,6 +145,7 @@ class OCRApp:
         hint = "拖曳圖片到左側，或點擊原圖區域選擇檔案"
         if not self._drag_drop_enabled:
             hint = "點擊原圖區域選擇檔案（安裝 tkinterdnd2 可啟用拖曳）"
+        self._hint_text = hint
         self._canvas_original.create_text(
             360,
             240,
@@ -498,6 +499,8 @@ class OCRApp:
 
     def _on_scan_done(self, result: dict) -> None:
         self._metadata = result.get("metadata", {})
+        self._predictions = result.get("predictions", [])
+        self._grouped = result.get("grouped", {})
         self._processed_image = self._build_processed_image()
 
         # 原始結果
@@ -529,6 +532,7 @@ class OCRApp:
         grouped_text = "\n".join(e["text"] for e in entries) if entries else "（無分組結果）"
         self._set_grouped_text(grouped_text, orient_label)
 
+        self._progress.stop()
         self._redraw_processed()
         self._preview_tabs.select(1)
         self._scan_btn.configure(state="normal")
